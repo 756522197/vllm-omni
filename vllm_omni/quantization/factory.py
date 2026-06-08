@@ -41,6 +41,13 @@ def _build_int8(**kw: Any) -> QuantizationConfig:
     return DiffusionInt8Config(**kw)
 
 
+def _build_mxfp8(**kw: Any) -> QuantizationConfig:
+    """Lazy import for W8A8 MXFP8 diffusion config (NPU only)."""
+    from .mxfp8_config import DiffusionMXFP8Config
+
+    return DiffusionMXFP8Config(**kw)
+
+
 def _build_inc(**kw: Any) -> QuantizationConfig:
     """Lazy import for INC/AutoRound config with checkpoint kwarg normalization."""
     from .inc_config import OmniINCConfig
@@ -58,11 +65,24 @@ def _build_inc(**kw: Any) -> QuantizationConfig:
 _OVERRIDES: dict[str, Callable[..., QuantizationConfig]] = {
     "gguf": _build_gguf,
     "int8": _build_int8,
+    "mxfp8": _build_mxfp8,
     "inc": _build_inc,
     "auto-round": _build_inc,
+    "auto_round": _build_inc,
 }
 
 SUPPORTED_QUANTIZATION_METHODS: list[str] = list(dict.fromkeys(QUANTIZATION_METHODS + list(_OVERRIDES.keys())))
+
+
+def _normalize_method_name(method: Any) -> str:
+    return str(method).lower().replace("-", "_")
+
+
+def _pop_method_name(spec: dict[str, Any]) -> str | None:
+    method = spec.pop("method", None)
+    if method is None:
+        method = spec.pop("quant_method", None)
+    return method
 
 
 def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
@@ -70,7 +90,7 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
 
     Resolution: _OVERRIDES first, then vLLM registry via from_config().
     """
-    method = method.lower()
+    method = _normalize_method_name(method)
 
     if method in _OVERRIDES:
         return _OVERRIDES[method](**kwargs)
@@ -92,16 +112,16 @@ def _build_single(method: str, **kwargs: Any) -> QuantizationConfig:
 def _is_per_component_dict(spec: dict[str, Any]) -> bool:
     """Check if a dict describes per-component quantization.
 
-    A per-component dict has no "method" key and all values are
+    A per-component dict has no "method"/"quant_method" key and all values are
     str, dict, or None. To avoid misdetecting a flat config with
     all-string values (e.g. {"activation_scheme": "static"}), we
-    require at least one value to be None or a dict with "method".
+    require at least one value to be None or a dict with "method"/"quant_method".
     """
-    if "method" in spec:
+    if "method" in spec or "quant_method" in spec:
         return False
     if not all(isinstance(v, (dict, str, type(None))) for v in spec.values()):
         return False
-    return any(v is None or (isinstance(v, dict) and "method" in v) for v in spec.values())
+    return any(v is None or (isinstance(v, dict) and ("method" in v or "quant_method" in v)) for v in spec.values())
 
 
 def _build_component_config(spec: dict[str, Any]) -> ComponentQuantizationConfig:
@@ -116,9 +136,9 @@ def _build_component_config(spec: dict[str, Any]) -> ComponentQuantizationConfig
             config = _build_single(value)
         elif isinstance(value, dict):
             value = dict(value)  # avoid mutating caller's dict
-            method = value.pop("method", None)
+            method = _pop_method_name(value)
             if method is None:
-                raise ValueError(f"Component '{prefix}' config dict must have a 'method' key")
+                raise ValueError(f"Component '{prefix}' config dict must have a 'method' or 'quant_method' key")
             config = _build_single(method, **value)
         else:
             raise TypeError(f"Component '{prefix}' config must be str, dict, or None, got {type(value).__name__}")
@@ -164,10 +184,10 @@ def build_quant_config(
         if _is_per_component_dict(spec):
             return _build_component_config(spec)
 
-        method = spec.pop("method", None)
+        method = _pop_method_name(spec)
         if method is None:
             raise ValueError(
-                "Dict quantization config must have a 'method' key or "
+                "Dict quantization config must have a 'method' or 'quant_method' key or "
                 "be a per-component config with component prefixes as keys."
             )
         merged = {**spec, **kwargs}

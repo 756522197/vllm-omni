@@ -18,6 +18,7 @@ from torch import nn
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import QKVParallelLinear, RowParallelLinear
+from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
@@ -332,6 +333,8 @@ class HunyuanVideo15Attention(nn.Module):
         out_bias: bool = True,
         eps: float = 1e-6,
         out_dim: int | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ):
         super().__init__()
 
@@ -350,6 +353,8 @@ class HunyuanVideo15Attention(nn.Module):
             head_size=self.head_dim,
             total_num_heads=self.heads,
             bias=bias,
+            quant_config=quant_config,
+            prefix=f"{prefix}.to_qkv" if prefix else "to_qkv",
         )
 
         self.to_out = nn.ModuleList(
@@ -360,6 +365,8 @@ class HunyuanVideo15Attention(nn.Module):
                     bias=out_bias,
                     input_is_parallel=True,
                     return_bias=False,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out" if prefix else "to_out",
                 ),
                 nn.Identity(),  # placeholder for dropout (none used)
             ]
@@ -374,6 +381,8 @@ class HunyuanVideo15Attention(nn.Module):
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
                 bias=added_proj_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.add_kv_proj" if prefix else "add_kv_proj",
             )
 
             self.to_add_out = RowParallelLinear(
@@ -382,6 +391,8 @@ class HunyuanVideo15Attention(nn.Module):
                 bias=out_bias,
                 input_is_parallel=True,
                 return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_add_out" if prefix else "to_add_out",
             )
 
         self.rope = RotaryEmbedding(is_neox_style=False)
@@ -492,6 +503,8 @@ class HunyuanVideo15TransformerBlock(nn.Module):
         attention_head_dim: int,
         mlp_ratio: float = 4.0,
         qk_norm: str = "rms_norm",
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         hidden_size = num_attention_heads * attention_head_dim
@@ -507,13 +520,27 @@ class HunyuanVideo15TransformerBlock(nn.Module):
             out_dim=hidden_size,
             bias=True,
             eps=1e-6,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn" if prefix else "attn",
         )
 
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.ff = FeedForward(dim=hidden_size, dim_out=hidden_size, mult=mlp_ratio)
+        self.ff = FeedForward(
+            dim=hidden_size,
+            dim_out=hidden_size,
+            mult=mlp_ratio,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ff" if prefix else "ff",
+        )
 
         self.norm2_context = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.ff_context = FeedForward(dim=hidden_size, dim_out=hidden_size, mult=mlp_ratio)
+        self.ff_context = FeedForward(
+            dim=hidden_size,
+            dim_out=hidden_size,
+            mult=mlp_ratio,
+            quant_config=quant_config,
+            prefix=f"{prefix}.ff_context" if prefix else "ff_context",
+        )
 
     def forward(
         self,
@@ -601,6 +628,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         target_size: int = 640,
         task_type: str = "i2v",
         use_meanflow: bool = False,
+        quant_config: QuantizationConfig | None = None,
     ):
         super().__init__()
 
@@ -632,9 +660,14 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
         self.transformer_blocks = nn.ModuleList(
             [
                 HunyuanVideo15TransformerBlock(
-                    num_attention_heads, attention_head_dim, mlp_ratio=mlp_ratio, qk_norm=qk_norm
+                    num_attention_heads,
+                    attention_head_dim,
+                    mlp_ratio=mlp_ratio,
+                    qk_norm=qk_norm,
+                    quant_config=quant_config,
+                    prefix=f"transformer_blocks.{layer_idx}",
                 )
-                for _ in range(num_layers)
+                for layer_idx in range(num_layers)
             ]
         )
 
@@ -828,7 +861,7 @@ class HunyuanVideo15Transformer3DModel(nn.Module):
             original_name = name
             lookup_name = name
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name:
+                if f"{weight_name}." not in original_name:
                     continue
                 lookup_name = original_name.replace(weight_name, param_name)
                 if lookup_name not in params_dict:

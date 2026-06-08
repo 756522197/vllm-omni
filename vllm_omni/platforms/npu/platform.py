@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from typing import Any
 
 import torch
+import torch.nn as nn
 from vllm.logger import init_logger
 from vllm_ascend.platform import NPUPlatform
 
@@ -12,6 +13,17 @@ from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBa
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 logger = init_logger(__name__)
+
+_DIFFUSION_PACKED_MODULES_MAPPING = {
+    "HunyuanVideo15Pipeline": {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
+    },
+    "HunyuanVideo15I2VPipeline": {
+        "to_qkv": ["to_q", "to_k", "to_v"],
+        "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
+    },
+}
 
 
 class NPUOmniPlatform(OmniPlatform, NPUPlatform):
@@ -52,6 +64,13 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         )
 
         prepare_hunyuan_fused_moe_runtime()
+
+    @classmethod
+    def get_diffusion_packed_modules_mapping(
+        cls,
+        model_class: type[nn.Module],
+    ) -> dict[str, list[str]] | None:
+        return _DIFFUSION_PACKED_MODULES_MAPPING.get(model_class.__name__, None)
 
     @classmethod
     def get_diffusion_attn_backend_cls(
